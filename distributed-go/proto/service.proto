@@ -1,0 +1,33 @@
+syntax = "proto3";
+package proto;
+option go_package = "./proto";
+
+service WorkerService {
+  rpc Sum(SumRequest) returns (SumResponse);
+  rpc Increment(IncrementRequest) returns (IncrementResponse);
+}
+
+service RegistryService {
+  rpc Register(ServerInfo) returns (Empty);
+  rpc Deregister(ServerInfo) returns (Empty);
+  rpc UpdateCPU(ServerInfo) returns (Empty);
+  rpc GetServers(Empty) returns (ServerList);
+}
+
+message Empty {}
+
+message SumRequest { int32 a = 1; int32 b = 2; }
+message SumResponse { int32 result = 1; }
+
+message IncrementRequest {}
+message IncrementResponse { int32 new_value = 1; }
+
+message ServerInfo {
+  string address = 1;
+  int32 cpu_usage = 2;
+  repeated string services = 3;
+}
+
+message ServerList {
+  repeated ServerInfo servers = 1;
+}

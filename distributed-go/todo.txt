@@ -1,0 +1,9 @@
+docker
+show log output from server
+dockerfile with env
+spawn multiple server with one command
+dipendencies and redis
+update port for multiple servers
+documentation
+all in english
+quickstart and dependecies in the readme
