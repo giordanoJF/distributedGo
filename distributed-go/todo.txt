@@ -12,3 +12,4 @@ specificare cpu random usage
 pulire redis ogni volta
 porta da specificare per piu worker
 porta default redis
+mettere i mutex anche sui worker
