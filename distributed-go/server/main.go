@@ -2,14 +2,14 @@ package main
 
 import (
 	"context"
-	//"fmt"
+	"fmt"
 	"log"
 	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"syscall"
-	//"time"
+	"time"
 
 	pb "distributed-go/proto"
 	"github.com/redis/go-redis/v9"
@@ -17,98 +17,193 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var rdb *redis.Client
+const (
+	defaultPort         = "8080"
+	defaultRegistryAddr = "localhost:5000"
+	defaultRedisAddr    = "localhost:6379"
+	redisCounterKey     = "global_counter"
+)
 
-// --- Services Implementation ---
+var (
+	redisClient *redis.Client
+)
+
+// WorkerServer implements the gRPC WorkerService interface.
+// It handles computational requests and maintains connection to the registry.
 type WorkerServer struct {
 	pb.UnimplementedWorkerServiceServer
-	registryClient pb.RegistryServiceClient //interfaccia client per chiamare su di lui i metodi
+	registryClient pb.RegistryServiceClient
 	myAddress      string
 	currentCPU     int32
 }
 
-func (s *WorkerServer) Sum(ctx context.Context, req *pb.SumRequest) (*pb.SumResponse, error) {
-	s.updateLoad(ctx)
-	return &pb.SumResponse{Result: req.A + req.B}, nil
-}
-
-func (s *WorkerServer) Increment(ctx context.Context, req *pb.IncrementRequest) (*pb.IncrementResponse, error) {
-	val, err := rdb.Incr(ctx, "global_counter").Result()
-	if err != nil {
-		return nil, err
+// NewWorkerServer creates a new instance of WorkerServer.
+func NewWorkerServer(registryClient pb.RegistryServiceClient, address string) *WorkerServer {
+	return &WorkerServer{
+		registryClient: registryClient,
+		myAddress:      address,
+		currentCPU:     generateRandomCPU(),
 	}
-	s.updateLoad(ctx)
-	return &pb.IncrementResponse{NewValue: int32(val)}, nil
 }
 
-// Simulate updating CPU load and notifying registry
-func (s *WorkerServer) updateLoad(ctx context.Context) {
-	// Simulate new random CPU load
-	s.currentCPU = int32(rand.Intn(100))
+// Sum implements the stateless sum service.
+// It adds two integers and updates the server's CPU load.
+func (s *WorkerServer) Sum(ctx context.Context, req *pb.SumRequest) (*pb.SumResponse, error) {
+	result := req.A + req.B
+	log.Printf("Sum request: %d + %d = %d", req.A, req.B, result)
 	
-	// Notify Registry
+	s.updateLoad(ctx)
+	
+	return &pb.SumResponse{Result: result}, nil
+}
+
+// Increment implements the stateful increment service.
+// It increments a global counter in Redis and updates the server's CPU load.
+func (s *WorkerServer) Increment(ctx context.Context, req *pb.IncrementRequest) (*pb.IncrementResponse, error) {
+	newValue, err := redisClient.Incr(ctx, redisCounterKey).Result()
+	if err != nil {
+		log.Printf("Error incrementing counter in Redis: %v", err)
+		return nil, fmt.Errorf("failed to increment counter: %w", err)
+	}
+	
+	log.Printf("Increment request: counter = %d", newValue)
+	s.updateLoad(ctx)
+	
+	return &pb.IncrementResponse{NewValue: int32(newValue)}, nil
+}
+
+// updateLoad simulates CPU load variation and notifies the registry.
+// This allows the registry to maintain accurate load information for routing decisions.
+func (s *WorkerServer) updateLoad(ctx context.Context) {
+	s.currentCPU = generateRandomCPU()
+	
 	_, err := s.registryClient.UpdateCPU(ctx, &pb.ServerInfo{
 		Address:  s.myAddress,
 		CpuUsage: s.currentCPU,
 	})
+	
 	if err != nil {
-		log.Printf("Failed to update CPU to registry: %v", err)
+		log.Printf("Warning: Failed to update CPU to registry: %v", err)
 	}
 }
 
-func main() {
-	// 1. Get ENV variables (also for Docker)
-	port := os.Getenv("PORT") // da usare quando lanci in worker con il terminale se ne vuoi piu di uno senza docker
-	if port == "" { port = "8080" }
-	registryAddr := os.Getenv("REGISTRY_ADDR") // e.g., "registry:5000"
-	if registryAddr == "" { registryAddr = "localhost:5000" }
-	myAddr := os.Getenv("MY_ADDR") // The address the client uses to reach me
-	if myAddr == "" { myAddr = "localhost:" + port } // Si auto-assegna localhost
-	redisAddr := os.Getenv("REDIS_ADDR")
-	if redisAddr == "" { redisAddr = "localhost:6379" } // Default Redis standard
+// generateRandomCPU simulates CPU usage between 0-100%.
+func generateRandomCPU() int32 {
+	return int32(rand.Intn(101))
+}
 
-	// 2. Setup Redis
-	rdb = redis.NewClient(&redis.Options{Addr: redisAddr})
-
-	// 3. Connect to Registry
-	conn, err := grpc.Dial(registryAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil { log.Fatalf("did not connect to registry: %v", err) }
-	registryClient := pb.NewRegistryServiceClient(conn)//montato e pronto per usarlo
-
-	// 4. Start gRPC Server
-	lis, err := net.Listen("tcp", ":"+port)
-	if err != nil { log.Fatalf("failed to listen: %v", err) }
-	
-	s := grpc.NewServer()
-	worker := &WorkerServer{
-		registryClient: registryClient,
-		myAddress:      myAddr,
-		currentCPU:     int32(rand.Intn(100)),
+// getEnvOrDefault returns the environment variable value or a default if not set.
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
 	}
-	pb.RegisterWorkerServiceServer(s, worker)
+	return defaultValue
+}
 
-	// 5. Register to Registry
-	log.Printf("Registering service at %s...", myAddr)
-	_, err = registryClient.Register(context.Background(), &pb.ServerInfo{
-		Address:  myAddr,
-		CpuUsage: worker.currentCPU,
+// registerWithRegistry registers this worker with the service registry.
+func registerWithRegistry(ctx context.Context, client pb.RegistryServiceClient, address string, cpu int32) error {
+	_, err := client.Register(ctx, &pb.ServerInfo{
+		Address:  address,
+		CpuUsage: cpu,
 		Services: []string{"sum_service", "increment_service"},
 	})
-	if err != nil { log.Fatalf("Register failed: %v", err) }
+	return err
+}
 
-	// 6. Graceful Shutdown Handling
+// deregisterFromRegistry removes this worker from the service registry.
+func deregisterFromRegistry(ctx context.Context, client pb.RegistryServiceClient, address string) {
+	_, err := client.Deregister(ctx, &pb.ServerInfo{Address: address})
+	if err != nil {
+		log.Printf("Error during deregistration: %v", err)
+	} else {
+		log.Println("Successfully deregistered from registry")
+	}
+}
+
+// setupGracefulShutdown handles OS signals for graceful shutdown.
+func setupGracefulShutdown(grpcServer *grpc.Server, registryClient pb.RegistryServiceClient, address string) {
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt, syscall.SIGTERM)
+	
 	go func() {
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-		<-sigChan
-		log.Println("Shutting down... Deregistering...")
-		registryClient.Deregister(context.Background(), &pb.ServerInfo{Address: myAddr})
-		s.GracefulStop()
+		sig := <-signalChan
+		log.Printf("Received signal: %v. Initiating graceful shutdown...", sig)
+		
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		
+		deregisterFromRegistry(ctx, registryClient, address)
+		grpcServer.GracefulStop()
+		
 		os.Exit(0)
 	}()
+}
 
-	log.Printf("Server listening on %s", port)
-	if err := s.Serve(lis); err != nil {
-		log.Fatalf("failed to serve: %v", err)
+func main() {
+	// Seed random number generator
+	rand.Seed(time.Now().UnixNano())
+
+	// Load configuration from environment variables
+	port := getEnvOrDefault("PORT", defaultPort)
+	registryAddr := getEnvOrDefault("REGISTRY_ADDR", defaultRegistryAddr)
+	myAddr := getEnvOrDefault("MY_ADDR", fmt.Sprintf("localhost:%s", port))
+	redisAddr := getEnvOrDefault("REDIS_ADDR", defaultRedisAddr)
+
+	// Initialize Redis client
+	redisClient = redis.NewClient(&redis.Options{
+		Addr: redisAddr,
+	})
+	defer redisClient.Close()
+
+	// Test Redis connection
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := redisClient.Ping(ctx).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis at %s: %v", redisAddr, err)
+	}
+	log.Printf("✓ Connected to Redis at %s", redisAddr)
+
+	// Connect to Registry
+	registryConn, err := grpc.Dial(
+		registryAddr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		log.Fatalf("Failed to connect to registry at %s: %v", registryAddr, err)
+	}
+	defer registryConn.Close()
+	
+	registryClient := pb.NewRegistryServiceClient(registryConn)
+	log.Printf("✓ Connected to registry at %s", registryAddr)
+
+	// Create TCP listener for gRPC server
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%s", port))
+	if err != nil {
+		log.Fatalf("Failed to listen on port %s: %v", port, err)
+	}
+
+	// Create and configure gRPC server
+	grpcServer := grpc.NewServer()
+	worker := NewWorkerServer(registryClient, myAddr)
+	pb.RegisterWorkerServiceServer(grpcServer, worker)
+
+	// Register with the service registry
+	log.Printf("Registering with service registry as %s...", myAddr)
+	if err := registerWithRegistry(context.Background(), registryClient, myAddr, worker.currentCPU); err != nil {
+		log.Fatalf("Failed to register with registry: %v", err)
+	}
+	log.Printf("✓ Successfully registered with registry")
+
+	// Setup graceful shutdown handling
+	setupGracefulShutdown(grpcServer, registryClient, myAddr)
+
+	// Start serving requests
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	log.Printf("Worker Server listening on :%s", port)
+	log.Printf("Advertised address: %s", myAddr)
+	log.Printf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	
+	if err := grpcServer.Serve(listener); err != nil {
+		log.Fatalf("Failed to serve: %v", err)
 	}
 }
