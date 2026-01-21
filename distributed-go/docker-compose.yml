@@ -1,0 +1,78 @@
+version: '3.8'
+
+services:
+  # Redis - Shared state storage
+  redis:
+    image: redis:7-alpine
+    container_name: distributed-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - distributed-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # Service Registry - Central service discovery
+  registry:
+    build:
+      context: .
+      dockerfile: Dockerfile.registry
+    container_name: distributed-registry
+    ports:
+      - "5000:5000"
+    environment:
+      - PORT=5000
+    networks:
+      - distributed-network
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "5000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Worker Servers - Can be scaled with docker-compose up --scale worker=N
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    depends_on:
+      registry:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      - PORT=8080
+      - REGISTRY_ADDR=registry:5000
+      - REDIS_ADDR=redis:6379
+      # MY_ADDR will be set dynamically for each scaled instance
+      - MY_ADDR=worker:8080
+    networks:
+      - distributed-network
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+  # Client - Interactive CLI interface
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    container_name: distributed-client
+    depends_on:
+      - registry
+    environment:
+      - REGISTRY_ADDR=registry:5000
+    networks:
+      - distributed-network
+    stdin_open: true
+    tty: true
+
+networks:
+  distributed-network:
+    driver: bridge
