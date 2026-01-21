@@ -7,3 +7,8 @@ update port for multiple servers
 documentation
 all in english
 quickstart and dependecies in the readme
+piu client con che porta escono?
+specificare cpu random usage
+pulire redis ogni volta
+porta da specificare per piu worker
+porta default redis
